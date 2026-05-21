@@ -13,7 +13,7 @@ on:
       - main  # Only deploy on main branch merges
 
 env:
-  GCP_PROJECT_ID: ops-ai-[YOUR-NAME]  # Replace [YOUR-NAME] with your project suffix
+  GCP_PROJECT_ID: ops-ai-dannyross
   GCP_ZONE: us-central1-a
   CLUSTER_NAME: operationalizing-ai
   ARTIFACT_REGISTRY_REGION: us-central1
@@ -31,6 +31,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+      with:
+        lfs: true
 
     # Authenticate to GCP using service account key (from GitHub Secret)
     - name: Authenticate to Google Cloud
