@@ -1,7 +1,9 @@
 """
 Precomputes all demand aggregations from demand_enriched.parquet at startup.
 Keeps only ~44K rows in memory (zone × hour × dow profile), not 6.3M raw rows.
+Includes graceful degradation: bad data is cleaned and logged rather than crashing.
 """
+import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -10,6 +12,8 @@ from datetime import datetime, timedelta
 import json
 import requests
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).parent.parent.parent
 DATA_PATH   = _ROOT / "data" / "processed" / "demand_enriched.parquet"
@@ -71,13 +75,88 @@ FEATURES = [
 ]
 
 
+def _validate_and_clean(df: pd.DataFrame, context: str = "data") -> pd.DataFrame:
+    """
+    Validate and clean a demand DataFrame in-place.
+    Logs every degradation action. Never raises — always returns usable data.
+    """
+    original_len = len(df)
+    actions = []
+
+    # 1. Drop duplicate rows (same zone + time window)
+    key_cols = [c for c in ["PULocationID", "time_bucket"] if c in df.columns]
+    if len(key_cols) == 2:
+        n_before = len(df)
+        df = df.drop_duplicates(subset=key_cols)
+        dropped = n_before - len(df)
+        if dropped > 0:
+            actions.append(f"dropped {dropped:,} duplicate rows")
+
+    # 2. Remove rows with invalid trip_count (negative, zero, or extreme outliers)
+    if "trip_count" in df.columns:
+        n_before = len(df)
+        df = df[(df["trip_count"] >= 1) & (df["trip_count"] <= 9000)]
+        dropped = n_before - len(df)
+        if dropped > 0:
+            actions.append(f"removed {dropped:,} rows with out-of-range trip_count")
+
+    # 3. Fix is_holiday flag using actual date where possible
+    if "is_holiday" in df.columns and "time_bucket" in df.columns:
+        try:
+            dates = pd.to_datetime(df["time_bucket"])
+            expected_holiday = dates.apply(
+                lambda d: 1 if (d.month, d.day) in HOLIDAYS else 0
+            )
+            drifted = (df["is_holiday"] != expected_holiday).sum()
+            if drifted > len(df) * 0.05:  # >5% of rows have wrong flag
+                df = df.copy()
+                df["is_holiday"] = expected_holiday.values
+                actions.append(f"corrected is_holiday flag for {drifted:,} rows")
+        except Exception as e:
+            logger.warning("[%s] Could not fix is_holiday flags: %s", context, e)
+
+    # 4. Null out contaminated lag_1week values for known bad zones
+    if "lag_1week" in df.columns and "PULocationID" in df.columns and "trip_count" in df.columns:
+        contaminated = []
+        for zone_id, grp in df.groupby("PULocationID"):
+            if len(grp) < 10:
+                continue
+            tc_mean = grp["trip_count"].mean()
+            lag_mean = grp["lag_1week"].mean()
+            if tc_mean > 0 and (lag_mean / tc_mean > 5.0 or lag_mean / tc_mean < 0.2):
+                contaminated.append(zone_id)
+        if contaminated:
+            df = df.copy()
+            mask = df["PULocationID"].isin(contaminated)
+            df.loc[mask, "lag_1week"] = np.nan
+            # Fill with zone median trip_count as fallback
+            for zone_id in contaminated:
+                zone_mask = df["PULocationID"] == zone_id
+                fallback = df.loc[zone_mask, "trip_count"].median()
+                df.loc[zone_mask, "lag_1week"] = df.loc[zone_mask, "lag_1week"].fillna(fallback)
+            actions.append(f"replaced contaminated lag_1week in {len(contaminated)} zone(s): {contaminated[:5]}")
+
+    if actions:
+        for action in actions:
+            logger.warning("[%s] Graceful degradation — %s", context, action)
+        logger.warning(
+            "[%s] Data cleaned: %d → %d rows (removed %d)",
+            context, original_len, len(df), original_len - len(df),
+        )
+    else:
+        logger.info("[%s] Data passed validation — no cleaning required", context)
+
+    return df
+
+
 def _load():
     print("[NYC Cab Analytics] Loading demand profile...")
     df = pd.read_parquet(
         DATA_PATH,
         columns=["PULocationID", "hour", "dayofweek", "trip_count", "is_holiday", "time_bucket"],
     )
-    
+    df = _validate_and_clean(df, context="profile")
+
     # Identify specific holidays
     df['time_bucket'] = pd.to_datetime(df['time_bucket'])
     df['holiday_name'] = df.apply(
@@ -135,6 +214,7 @@ def _load_full_demand():
     print("[NYC Cab Analytics] Loading full demand data for forecasting...")
     df = pd.read_parquet(DATA_PATH)
     df['time_bucket'] = pd.to_datetime(df['time_bucket'])
+    df = _validate_and_clean(df, context="full_demand")
     return df
 
 
